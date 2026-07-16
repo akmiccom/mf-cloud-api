@@ -1,7 +1,10 @@
-.venv
 .env
-
-__pycache__
 token.json
+token.json.tmp
 
-output
+.venv/
+__pycache__/
+*.pyc
+
+.vscode/
+output/
