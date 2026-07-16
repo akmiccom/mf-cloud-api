@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 import time
@@ -13,17 +14,11 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 from dotenv import load_dotenv
-import os
 
-# ============================================================
-# Money Forward Cloud OAuth settings
-# ============================================================
 
 AUTHORIZATION_URL = "https://api.biz.moneyforward.com/authorize"
 TOKEN_URL = "https://api.biz.moneyforward.com/token"
 
-# 接続確認用スコープ
-# SCOPES = ["mfc/admin/tenant.read"]
 SCOPES = [
     "mfc/admin/tenant.read",
     "mfc/accounting/offices.read",
@@ -34,9 +29,7 @@ SCOPES = [
 BASE_DIR = Path(__file__).resolve().parent
 TOKEN_FILE = BASE_DIR / "token.json"
 
-# アクセストークンの期限直前ではなく、少し早めに更新する
 TOKEN_EXPIRY_MARGIN_SECONDS = 60
-
 REQUEST_TIMEOUT_SECONDS = 30
 
 
@@ -59,16 +52,15 @@ def load_settings() -> Settings:
     client_secret = os.getenv("MF_CLIENT_SECRET", "").strip()
     redirect_uri = os.getenv("MF_REDIRECT_URI", "").strip()
 
-    missing = []
-
-    if not client_id:
-        missing.append("MF_CLIENT_ID")
-
-    if not client_secret:
-        missing.append("MF_CLIENT_SECRET")
-
-    if not redirect_uri:
-        missing.append("MF_REDIRECT_URI")
+    missing = [
+        name
+        for name, value in {
+            "MF_CLIENT_ID": client_id,
+            "MF_CLIENT_SECRET": client_secret,
+            "MF_REDIRECT_URI": redirect_uri,
+        }.items()
+        if not value
+    ]
 
     if missing:
         raise OAuthError(".envに必要な設定がありません: " + ", ".join(missing))
@@ -77,15 +69,14 @@ def load_settings() -> Settings:
 
     if parsed_redirect.scheme != "http":
         raise OAuthError(
-            "ローカル接続確認では、MF_REDIRECT_URIを"
+            "ローカル実行ではMF_REDIRECT_URIを"
             "'http://localhost:8000/callback'にしてください。"
         )
 
     if parsed_redirect.hostname not in {"localhost", "127.0.0.1"}:
         raise OAuthError(
             "このプログラムはlocalhost用です。"
-            "MF_REDIRECT_URIを"
-            "'http://localhost:8000/callback'にしてください。"
+            "MF_REDIRECT_URIを確認してください。"
         )
 
     if parsed_redirect.path != "/callback":
@@ -115,8 +106,8 @@ def load_token() -> dict[str, Any] | None:
     return token
 
 
-def save_token(token: dict[str, Any]) -> None:
-    """トークンと取得時刻・有効期限をtoken.jsonへ保存する。"""
+def save_token(token: dict[str, Any]) -> dict[str, Any]:
+    """トークンと有効期限をtoken.jsonへ安全に保存する。"""
     saved_token = dict(token)
 
     now = int(time.time())
@@ -129,22 +120,17 @@ def save_token(token: dict[str, Any]) -> None:
 
     try:
         with temporary_file.open("w", encoding="utf-8") as file:
-            json.dump(
-                saved_token,
-                file,
-                ensure_ascii=False,
-                indent=2,
-            )
-
+            json.dump(saved_token, file, ensure_ascii=False, indent=2)
         temporary_file.replace(TOKEN_FILE)
     except OSError as exc:
         raise OAuthError(f"トークンを保存できませんでした: {exc}") from exc
 
     print(f"トークンを保存しました: {TOKEN_FILE}")
+    return saved_token
 
 
 def is_access_token_valid(token: dict[str, Any]) -> bool:
-    """アクセストークンがまだ有効か確認する。"""
+    """アクセストークンが有効期限内か確認する。"""
     access_token = token.get("access_token")
     expires_at = token.get("expires_at")
 
@@ -167,12 +153,15 @@ def response_error_message(response: requests.Response) -> str:
     except ValueError:
         detail = response.text.strip() or "(response body is empty)"
 
-    request_id = response.headers.get("X-Request-Id") or response.headers.get(
-        "x-request-id"
+    request_id = (
+        response.headers.get("X-Request-Id")
+        or response.headers.get("x-request-id")
     )
 
     message = (
-        f"HTTP {response.status_code}\n" f"URL: {response.url}\n" f"Response:\n{detail}"
+        f"HTTP {response.status_code}\n"
+        f"URL: {response.url}\n"
+        f"Response:\n{detail}"
     )
 
     if request_id:
@@ -193,11 +182,8 @@ def exchange_authorization_code(
             "code": authorization_code,
             "redirect_uri": settings.redirect_uri,
         },
-        # CLIENT_SECRET_BASICなのでHTTP Basic認証を使う
         auth=(settings.client_id, settings.client_secret),
-        headers={
-            "Accept": "application/json",
-        },
+        headers={"Accept": "application/json"},
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
@@ -212,15 +198,14 @@ def exchange_authorization_code(
     if not token.get("access_token"):
         raise OAuthError("トークンレスポンスにaccess_tokenがありません。")
 
-    save_token(token)
-    return load_token() or token
+    return save_token(token)
 
 
 def refresh_access_token(
     settings: Settings,
     token: dict[str, Any],
 ) -> dict[str, Any]:
-    """リフレッシュトークンでアクセストークンを更新する。"""
+    """refresh_tokenでアクセストークンを更新する。"""
     refresh_token = token.get("refresh_token")
 
     if not refresh_token:
@@ -237,9 +222,7 @@ def refresh_access_token(
             "refresh_token": refresh_token,
         },
         auth=(settings.client_id, settings.client_secret),
-        headers={
-            "Accept": "application/json",
-        },
+        headers={"Accept": "application/json"},
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
@@ -254,18 +237,13 @@ def refresh_access_token(
     if not refreshed_token.get("access_token"):
         raise OAuthError("更新レスポンスにaccess_tokenがありません。")
 
-    # サーバーが新しいrefresh_tokenを返さない場合に備える
     if not refreshed_token.get("refresh_token"):
         refreshed_token["refresh_token"] = refresh_token
 
-    save_token(refreshed_token)
-    return load_token() or refreshed_token
+    return save_token(refreshed_token)
 
 
-def build_authorization_url(
-    settings: Settings,
-    state: str,
-) -> str:
+def build_authorization_url(settings: Settings, state: str) -> str:
     """ブラウザで開く認可URLを生成する。"""
     query = urlencode(
         {
@@ -276,30 +254,19 @@ def build_authorization_url(
             "state": state,
         }
     )
-
     return f"{AUTHORIZATION_URL}?{query}"
 
 
-def get_callback_server_address(
-    redirect_uri: str,
-) -> tuple[str, int]:
-    parsed = urlparse(redirect_uri)
-
-    hostname = parsed.hostname or "localhost"
-    port = parsed.port or 80
-
-    return hostname, port
-
-
 def authorize_in_browser(settings: Settings) -> dict[str, Any]:
-    """
-    ローカルHTTPサーバーを起動し、ブラウザ認証結果のcodeを受け取る。
-    """
+    """localhostでコールバックを受信し、ブラウザ認証を完了する。"""
     state = secrets.token_urlsafe(32)
     authorization_result: dict[str, str] = {}
     callback_received = threading.Event()
 
-    expected_path = urlparse(settings.redirect_uri).path
+    parsed_redirect = urlparse(settings.redirect_uri)
+    expected_path = parsed_redirect.path
+    host = parsed_redirect.hostname or "localhost"
+    port = parsed_redirect.port or 80
 
     class CallbackHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -311,84 +278,56 @@ def authorize_in_browser(settings: Settings) -> dict[str, Any]:
                 return
 
             query = parse_qs(parsed_request.query)
-
             returned_state = query.get("state", [""])[0]
             authorization_code = query.get("code", [""])[0]
             oauth_error = query.get("error", [""])[0]
-            error_description = query.get(
-                "error_description",
-                [""],
-            )[0]
+            error_description = query.get("error_description", [""])[0]
 
             if returned_state != state:
                 authorization_result["error"] = (
                     "stateが一致しません。認証要求が改ざんされた可能性があります。"
                 )
                 status_code = 400
-                browser_message = (
-                    "認証に失敗しました。"
-                    "このタブを閉じて、ターミナルを確認してください。"
-                )
+                browser_message = "認証に失敗しました。ターミナルを確認してください。"
             elif oauth_error:
-                authorization_result["error"] = f"{oauth_error}: {error_description}"
-                status_code = 400
-                browser_message = (
-                    "認証がキャンセルされたか、失敗しました。"
-                    "このタブを閉じてください。"
+                authorization_result["error"] = (
+                    f"{oauth_error}: {error_description}"
                 )
+                status_code = 400
+                browser_message = "認証がキャンセルされたか、失敗しました。"
             elif not authorization_code:
                 authorization_result["error"] = (
                     "コールバックURLに認可コードがありません。"
                 )
                 status_code = 400
-                browser_message = (
-                    "認可コードを取得できませんでした。" "このタブを閉じてください。"
-                )
+                browser_message = "認可コードを取得できませんでした。"
             else:
                 authorization_result["code"] = authorization_code
                 status_code = 200
                 browser_message = (
                     "マネーフォワード クラウドの認証が完了しました。"
-                    "このタブを閉じて、ターミナルへ戻ってください。"
+                    "このタブを閉じてください。"
                 )
 
             body = f"""<!doctype html>
 <html lang="ja">
-<head>
-  <meta charset="utf-8">
-  <title>Money Forward OAuth</title>
-</head>
+<head><meta charset="utf-8"><title>Money Forward OAuth</title></head>
 <body style="font-family: sans-serif; margin: 3rem;">
-  <h1>{browser_message}</h1>
+<h1>{browser_message}</h1>
 </body>
 </html>
 """
-
             encoded_body = body.encode("utf-8")
 
             self.send_response(status_code)
-            self.send_header(
-                "Content-Type",
-                "text/html; charset=utf-8",
-            )
-            self.send_header(
-                "Content-Length",
-                str(len(encoded_body)),
-            )
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded_body)))
             self.end_headers()
             self.wfile.write(encoded_body)
-
             callback_received.set()
 
-        def log_message(
-            self,
-            format: str,
-            *args: object,
-        ) -> None:
-            # localhostへのアクセスログを非表示にする
+        def log_message(self, format: str, *args: object) -> None:
             return
-
-    host, port = get_callback_server_address(settings.redirect_uri)
 
     try:
         server = HTTPServer((host, port), CallbackHandler)
@@ -405,40 +344,31 @@ def authorize_in_browser(settings: Settings) -> dict[str, Any]:
     print(authorization_url)
     print()
 
-    opened = webbrowser.open(authorization_url)
-
-    if not opened:
+    if not webbrowser.open(authorization_url):
         print("ブラウザを自動起動できませんでした。上記URLを開いてください。")
 
     try:
-        # コールバックを1回処理するまで待機
         while not callback_received.is_set():
             server.handle_request()
     finally:
         server.server_close()
 
     if "error" in authorization_result:
-        raise OAuthError("ブラウザ認証に失敗しました: " + authorization_result["error"])
+        raise OAuthError(
+            "ブラウザ認証に失敗しました: "
+            + authorization_result["error"]
+        )
 
     authorization_code = authorization_result.get("code")
 
     if not authorization_code:
         raise OAuthError("認可コードを取得できませんでした。")
 
-    return exchange_authorization_code(
-        settings,
-        authorization_code,
-    )
+    return exchange_authorization_code(settings, authorization_code)
 
 
 def get_valid_token(settings: Settings) -> dict[str, Any]:
-    """
-    有効なトークンを返す。
-
-    1. token.jsonが有効なら再利用
-    2. 期限切れならrefresh_tokenで更新
-    3. トークンがなければブラウザ認証
-    """
+    """保存済み・更新済み・新規認証済みの有効なトークンを返す。"""
     token = load_token()
 
     if token and is_access_token_valid(token):

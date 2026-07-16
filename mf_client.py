@@ -20,9 +20,7 @@ class MoneyForwardClient:
         self.settings = load_settings()
 
     def _get_access_token(self) -> str:
-        """有効なアクセストークンを取得する。"""
         token = get_valid_token(self.settings)
-
         access_token = token.get("access_token")
 
         if not access_token:
@@ -38,14 +36,11 @@ class MoneyForwardClient:
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """MFクラウドAPIへ共通形式でリクエストする。"""
-        access_token = self._get_access_token()
-
         response = requests.request(
             method=method,
             url=url,
             headers={
-                "Authorization": f"Bearer {access_token}",
+                "Authorization": f"Bearer {self._get_access_token()}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },
@@ -56,8 +51,7 @@ class MoneyForwardClient:
 
         if response.status_code == 401:
             raise OAuthError(
-                "認証に失敗しました。"
-                "アクセストークンが期限切れまたは無効な可能性があります。\n"
+                "認証に失敗しました。アクセストークンが無効です。\n"
                 + response_error_message(response)
             )
 
@@ -91,7 +85,7 @@ class MoneyForwardClient:
         *,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.request(method="GET", url=url, params=params)
+        return self.request("GET", url, params=params)
 
     def post(
         self,
@@ -99,4 +93,4 @@ class MoneyForwardClient:
         *,
         json_data: dict[str, Any],
     ) -> dict[str, Any]:
-        return self.request(method="POST", url=url, json_data=json_data)
+        return self.request("POST", url, json_data=json_data)
