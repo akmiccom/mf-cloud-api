@@ -23,7 +23,13 @@ AUTHORIZATION_URL = "https://api.biz.moneyforward.com/authorize"
 TOKEN_URL = "https://api.biz.moneyforward.com/token"
 
 # 接続確認用スコープ
-SCOPES = ["mfc/admin/tenant.read"]
+# SCOPES = ["mfc/admin/tenant.read"]
+SCOPES = [
+    "mfc/admin/tenant.read",
+    "mfc/accounting/offices.read",
+    "mfc/accounting/accounts.read",
+    "mfc/accounting/journal.read",
+]
 
 BASE_DIR = Path(__file__).resolve().parent
 TOKEN_FILE = BASE_DIR / "token.json"
