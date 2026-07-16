@@ -1,0 +1,5 @@
+Client ID：取得済み
+Client Secret：取得済み
+登録したリダイレクトURI：http://localhost:8000/callback 
+
+取得でしました。ブラウザ認証からトークン保存、接続確認まで行うPythonコードを作成して。
