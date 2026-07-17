@@ -7,7 +7,7 @@ akmic合同会社のバックオフィス用API連携リポジトリです。総
 ```text
 mf-cloud-api/
 ├─ .env                    # 認証情報。Gitへ保存しない
-├─ .env_local              # 機密情報を含まないローカル設定例
+├─ .env.example            # 機密情報を含まない設定例
 ├─ .gitignore
 ├─ AGENTS.md               # リポジトリ固有の作業指示
 ├─ requirements.txt
@@ -28,7 +28,7 @@ mf-cloud-api/
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .env_local .env
+Copy-Item .env.example .env
 ```
 
 `.env`へClient IDとClient Secretを設定してください。
