@@ -61,6 +61,19 @@ python get_journals.py `
   --per-page 100
 ```
 
+対象期間の全ページを取得する場合は、`--all-pages`を指定します。
+
+```powershell
+python get_journals.py `
+  --start-date 2025-11-01 `
+  --end-date 2026-10-31 `
+  --all-pages
+```
+
+全ページ取得では`page=1`から順に最大1000ページを取得し、全ページの仕訳をまとめて`_all.json`と`_all.csv`へ保存します。APIのページネーション情報が使えない場合は、取得件数が`--per-page`未満のページまたは空ページで終了します。`--all-pages`と`--page`は同時に指定できません。従来どおり`--all-pages`を省略すると単一ページ（既定は1ページ目）だけを取得します。
+
+仕訳取得時にはraw CSVとJSONに加え、`branches`を1 branch 1行に展開した`*_expanded.csv`も出力します。全ページ取得時は`journals_<開始日>_<終了日>_expanded.csv`、単一ページ取得時は`journals_<開始日>_<終了日>_page<ページ番号>_expanded.csv`です。展開CSVはUTF-8 BOM付きで、仕訳情報をbranchごとに繰り返し、借方・貸方の勘定科目、補助科目、金額、税、部門、取引先および関連IDを列に分けます。
+
 ## 認証スコープ
 
 ```python
