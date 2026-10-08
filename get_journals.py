@@ -7,13 +7,14 @@ import sys
 from collections import Counter
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
 from mf_auth import OAuthError
 from mf_client import MoneyForwardClient
 from mf_endpoints import JOURNALS_URL, OFFICES_URL
+from backup_support import BackupError, api_total_count, utc_now, validate_total
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -41,12 +42,17 @@ JOURNAL_BRANCH_COLUMNS = (
     "journal_memo",
     "journal_transaction_id",
     "journal_voucher_file_ids",
+    "journal_tags",
+    "journal_term_period",
+    "journal_create_time",
+    "journal_update_time",
     "branch_index",
     "remark",
     "debitor_account_name",
     "debitor_sub_account_name",
     "debitor_value",
     "debitor_tax_name",
+    "debitor_tax_long_name",
     "debitor_tax_value",
     "debitor_department_name",
     "debitor_trade_partner_name",
@@ -60,6 +66,7 @@ JOURNAL_BRANCH_COLUMNS = (
     "creditor_sub_account_name",
     "creditor_value",
     "creditor_tax_name",
+    "creditor_tax_long_name",
     "creditor_tax_value",
     "creditor_department_name",
     "creditor_trade_partner_name",
@@ -75,6 +82,7 @@ BRANCH_SIDE_FIELDS = (
     "sub_account_name",
     "value",
     "tax_name",
+    "tax_long_name",
     "tax_value",
     "department_name",
     "trade_partner_name",
@@ -85,6 +93,10 @@ BRANCH_SIDE_FIELDS = (
     "trade_partner_code",
     "invoice_kind",
 )
+
+
+class JournalFetchError(BackupError, OAuthError):
+    """Safe validation failure compatible with the existing OAuthError callers."""
 
 
 def parse_date(value: str) -> str:
@@ -120,6 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="取得するページ（省略時は1）",
     )
     parser.add_argument("--per-page", type=int, default=100)
+    parser.add_argument("--overwrite", action="store_true",
+                        help="明示的に既存出力先を再利用する（既存ファイルを上書き）")
     parser.add_argument(
         "--all-pages",
         action="store_true",
@@ -231,7 +245,7 @@ def fetch_journal_page(
 
 def _pagination_metadata(result: dict[str, Any]) -> dict[str, Any] | None:
     """ページネーション情報として認識できるレスポンス部分を返す。"""
-    for key in ("pagination", "paging", "meta"):
+    for key in ("metadata", "pagination", "paging", "meta"):
         value = result.get(key)
         if isinstance(value, dict) and any(
             field in value for field in PAGINATION_KEYS
@@ -244,60 +258,55 @@ def _pagination_metadata(result: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _pagination_integer(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not (
+        isinstance(value, int) or (isinstance(value, str) and value.isdecimal())
+    ) or int(value) < 0:
+        raise BackupError(f"paginationの{name}が非負整数ではありません。")
+    return int(value)
+
+
 def _has_more_pages(
-    result: dict[str, Any],
-    current_page: int,
-    per_page: int,
+    result: dict[str, Any], current_page: int, per_page: int,
 ) -> bool | None:
-    """ページネーション情報があれば次ページの有無を返す。"""
+    """不正・矛盾したpaginationは成功扱いにしない。"""
     metadata = _pagination_metadata(result)
     if metadata is None:
         return None
-
-    for key in ("has_next_page", "has_next"):
-        value = metadata.get(key)
-        if isinstance(value, bool):
-            return value
-
-    for key in ("is_last_page", "is_last"):
-        value = metadata.get(key)
-        if isinstance(value, bool):
-            return not value
-
+    page_value = metadata.get("current_page", metadata.get("page_number", metadata.get("page", current_page)))
+    metadata_page = _pagination_integer(page_value, "current_page")
+    if metadata_page != current_page:
+        raise BackupError("paginationの現在ページが要求ページと一致しません。")
+    decisions: list[bool] = []
+    for key in ("has_next_page", "has_next", "is_last_page", "is_last"):
+        if key in metadata:
+            value = metadata[key]
+            if not isinstance(value, bool):
+                raise BackupError(f"paginationの{key}がbooleanではありません。")
+            decisions.append(not value if key.startswith("is_last") else value)
     if "next_page" in metadata:
-        next_page = metadata["next_page"]
-        if next_page is None or next_page is False or next_page == "":
-            return False
-        if isinstance(next_page, int) and not isinstance(next_page, bool):
-            return next_page > current_page
-        return True
-
-    page_value = metadata.get(
-        "current_page",
-        metadata.get("page_number", metadata.get("page", current_page)),
-    )
-    try:
-        metadata_page = int(page_value)
-    except (TypeError, ValueError):
-        metadata_page = current_page
-
+        value = metadata["next_page"]
+        if value is None or value is False or value == "" or value == 0:
+            decisions.append(False)
+        else:
+            next_page = _pagination_integer(value, "next_page")
+            if next_page != current_page + 1:
+                raise BackupError("paginationのnext_pageが連続していません。")
+            decisions.append(True)
     for key in ("total_pages", "page_count"):
         if key in metadata:
-            try:
-                return metadata_page < int(metadata[key])
-            except (TypeError, ValueError):
-                pass
-
-    for key in ("total_count", "total_entries"):
-        if key in metadata:
-            try:
-                total_count = int(metadata[key])
-            except (TypeError, ValueError):
-                continue
-            return metadata_page * per_page < total_count
-
-    return None
-
+            total_pages = _pagination_integer(metadata[key], key)
+            if (total_pages > 0 and current_page > total_pages) or (
+                total_pages == 0 and find_journal_list(result)
+            ):
+                raise BackupError("paginationの総ページ数が応答内容と矛盾しています。")
+            decisions.append(current_page < total_pages)
+    if decisions:
+        if len(set(decisions)) != 1:
+            raise BackupError("paginationの次ページ情報が矛盾しています。")
+        return decisions[0]
+    total = api_total_count(result)
+    return current_page * per_page < total if total is not None else None
 
 def fetch_all_journals(
     client: MoneyForwardClient,
@@ -306,14 +315,14 @@ def fetch_all_journals(
     per_page: int,
     *,
     max_pages: int = MAX_PAGES,
+    on_page: Callable[[int, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """1ページ目から取得し、全ページの仕訳をひとつのレスポンスへまとめる。"""
+    """RAW保存callbackの後に検証し、API metadataと独自metadataを分離する。"""
     if max_pages < 1:
         raise ValueError("max_pagesは1以上でなければなりません。")
 
-    combined_result: dict[str, Any] | None = None
-    journal_key: str | None = None
     all_journals: list[dict[str, Any]] = []
+    expected_total: int | None = None
     page = 1
 
     while page <= max_pages:
@@ -324,33 +333,35 @@ def fetch_all_journals(
             page,
             per_page,
         )
+        if on_page is not None:
+            on_page(page, result)
+        raw_list = next((result[key] for key in JOURNAL_LIST_KEYS
+                         if isinstance(result.get(key), list)), None)
+        if raw_list is None or any(not isinstance(item, dict) for item in raw_list):
+            raise BackupError("仕訳配列が存在しないか、object以外の要素を含んでいます。")
         page_journals = find_journal_list(result)
         all_journals.extend(page_journals)
+        page_total = api_total_count(result)
+        if page_total is not None:
+            if expected_total is not None and page_total != expected_total:
+                raise BackupError("API total_countが取得途中で変化しました。再取得が必要です。")
+            expected_total = page_total
         print(
             f"ページ {page}: {len(page_journals)}件 "
             f"(累計 {len(all_journals)}件)"
         )
 
-        if combined_result is None:
-            combined_result = dict(result)
-            journal_key = next(
-                (
-                    key
-                    for key in JOURNAL_LIST_KEYS
-                    if isinstance(result.get(key), list)
-                ),
-                "journals",
-            )
-
         has_more = _has_more_pages(result, page, per_page)
         if not page_journals or has_more is False:
+            if not page_journals and has_more is True:
+                raise BackupError("空ページですがAPIは次ページありと報告しています。")
             break
 
         if page == max_pages:
             if has_more is True or len(page_journals) >= per_page:
-                raise OAuthError(
+                raise JournalFetchError(
                     f"安全上限の{max_pages}ページに達したため、"
-                    "全ページ取得を中止しました。データは保存していません。"
+                    "全ページ取得を中止しました。完了扱いにはしません。"
                 )
             break
 
@@ -359,14 +370,13 @@ def fetch_all_journals(
 
         page += 1
 
-    if combined_result is None:
-        return {"journals": []}
-
-    assert journal_key is not None
-    combined_result[journal_key] = all_journals
-    combined_result["retrieved_pages"] = page
-    combined_result["retrieved_journal_count"] = len(all_journals)
-    return combined_result
+    validate_total(len(all_journals), expected_total)
+    return {"journals": all_journals, "backup_metadata": {
+        "retrieved_at": utc_now(), "start_date": start_date, "end_date": end_date,
+        "retrieved_pages": page, "retrieved_journal_count": len(all_journals),
+        "api_total_count": expected_total, "total_count_verified": expected_total is not None,
+        "complete": True,
+    }}
 
 
 def detect_duplicate_journals(
@@ -472,6 +482,10 @@ def flatten_journal_branches(
         "memo": "memo",
         "transaction_id": "transaction_id",
         "voucher_file_ids": "voucher_file_ids",
+        "tags": "tags",
+        "term_period": "term_period",
+        "create_time": "create_time",
+        "update_time": "update_time",
     }
 
     for journal_index, journal in enumerate(
@@ -494,7 +508,7 @@ def flatten_journal_branches(
                 value = journal.get(source_name)
                 row[f"journal_{output_name}"] = (
                     scalar_value(value)
-                    if output_name == "voucher_file_ids"
+                    if output_name in {"voucher_file_ids", "tags"}
                     else "" if value is None else value
                 )
 
@@ -517,19 +531,20 @@ def flatten_journal_branches(
 def save_json(
     result: dict[str, Any],
     output_path: Path,
+    *, overwrite: bool = False,
 ) -> None:
-    output_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    with output_path.open("w" if overwrite else "x", encoding="utf-8") as file:
+        json.dump(result, file, ensure_ascii=False, indent=2)
 
 
 def save_csv(
     rows: list[dict[str, Any]],
     output_path: Path,
+    *, overwrite: bool = False,
 ) -> None:
     if not rows:
-        output_path.write_text("", encoding="utf-8-sig")
+        with output_path.open("w" if overwrite else "x", encoding="utf-8-sig"):
+            pass
         return
 
     fieldnames: list[str] = []
@@ -542,7 +557,7 @@ def save_csv(
                 fieldnames.append(key)
 
     with output_path.open(
-        "w",
+        "w" if overwrite else "x",
         encoding="utf-8-sig",
         newline="",
     ) as file:
@@ -558,10 +573,11 @@ def save_csv(
 def save_expanded_csv(
     rows: list[dict[str, Any]],
     output_path: Path,
+    *, overwrite: bool = False,
 ) -> None:
     """固定列順のbranch展開CSVをUTF-8 BOM付きで保存する。"""
     with output_path.open(
-        "w",
+        "w" if overwrite else "x",
         encoding="utf-8-sig",
         newline="",
     ) as file:
@@ -575,154 +591,23 @@ def save_expanded_csv(
 
 
 def main() -> int:
+    # Import here to keep the existing conversion/fetch helpers independently usable.
+    from mf_backup import run_journals_cli
     args = build_parser().parse_args()
-
     if args.all_pages and args.page is not None:
-        print(
-            "エラー: --all-pagesと--pageは同時に指定できません。",
-            file=sys.stderr,
-        )
+        print("エラー: --all-pagesと--pageは同時に指定できません。", file=sys.stderr)
         return 2
-
     page = args.page if args.page is not None else 1
-    if page < 1:
-        print("エラー: pageは1以上にしてください。", file=sys.stderr)
+    if page < 1 or not 1 <= args.per_page <= 10000:
+        print("エラー: pageは1以上、per-pageは1～10000にしてください。", file=sys.stderr)
         return 2
-
-    if not 1 <= args.per_page <= 100:
-        print("エラー: per-pageは1～100にしてください。", file=sys.stderr)
+    if bool(args.start_date) != bool(args.end_date):
+        print("エラー: 開始日と終了日を両方指定してください。", file=sys.stderr)
         return 2
-
-    try:
-        client = MoneyForwardClient()
-
-        start_date, end_date, fiscal_year, used_default = resolve_date_range(
-            client,
-            args.start_date,
-            args.end_date,
-        )
-
-        if start_date > end_date:
-            print(
-                "エラー: start-dateはend-date以前にしてください。",
-                file=sys.stderr,
-            )
-            return 2
-
-        if args.all_pages:
-            result = fetch_all_journals(
-                client,
-                start_date,
-                end_date,
-                args.per_page,
-            )
-            base_name = f"journals_{start_date}_{end_date}_all"
-        else:
-            result = fetch_journal_page(
-                client,
-                start_date,
-                end_date,
-                page,
-                args.per_page,
-            )
-            base_name = (
-                f"journals_{start_date}_{end_date}"
-                f"_page{page}"
-            )
-
-        output_dir = args.output_dir.resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        json_path = output_dir / f"{base_name}.json"
-        csv_path = output_dir / f"{base_name}.csv"
-
-        journals = find_journal_list(result)
-        duplicates = detect_duplicate_journals(journals)
-        if duplicates:
-            duplicate_count = sum(duplicates.values())
-            duplicate_ids = ", ".join(
-                f"{identifier} ({count}回)"
-                for identifier, count in duplicates.items()
-            )
-            print(
-                f"警告: 重複仕訳IDを{duplicate_count}件検出しました: "
-                f"{duplicate_ids}"
-            )
-
-        rows = flatten_journals(result)
-        expanded_rows = flatten_journal_branches(result)
-        expanded_journal_count = len(
-            {row["journal_index"] for row in expanded_rows}
-        )
-        if expanded_journal_count != len(journals):
-            raise OAuthError(
-                "expanded CSVの仕訳数が取得件数と一致しません。"
-                f"取得: {len(journals)}件、展開: {expanded_journal_count}件。"
-                "ファイルは保存していません。"
-            )
-
-        save_json(result, json_path)
-        save_csv(rows, csv_path)
-        expanded_base_name = (
-            f"journals_{start_date}_{end_date}_expanded"
-            if args.all_pages
-            else (
-                f"journals_{start_date}_{end_date}"
-                f"_page{page}_expanded"
-            )
-        )
-        expanded_csv_path = output_dir / f"{expanded_base_name}.csv"
-        save_expanded_csv(expanded_rows, expanded_csv_path)
-
-        print("=" * 60)
-        print("仕訳一覧の取得と保存に成功しました。")
-        print("=" * 60)
-
-        if used_default:
-            fiscal_year_text = (
-                f"（fiscal_year: {fiscal_year}）"
-                if fiscal_year is not None
-                else ""
-            )
-            print(f"使用期間: {start_date} ～ {end_date} {fiscal_year_text}")
-            print("期間指定: 現在の会計期間を自動選択")
-        else:
-            print(f"使用期間: {start_date} ～ {end_date}")
-            print("期間指定: コマンドライン引数")
-
-        print(f"Journals fetched : {len(journals)}")
-        print(f"Branches expanded: {len(expanded_rows)}")
-        print(f"Raw CSV          : {csv_path.name}")
-        print(f"Expanded CSV     : {expanded_csv_path.name}")
-        print(f"JSON             : {json_path.name}")
-        print(f"CSV行数: {len(rows)}")
-        print(f"JSON保存先: {json_path}")
-        print(f"CSV保存先 : {csv_path}")
-        print(f"展開CSV保存先: {expanded_csv_path}")
-
-        if not rows:
-            print(
-                "警告: 仕訳配列を検出できなかったため、"
-                "CSVは空で保存されました。"
-            )
-
-        return 0
-
-    except OAuthError as exc:
-        print(f"エラー: {exc}", file=sys.stderr)
-        return 1
-    except OSError as exc:
-        print(f"ファイル保存エラー: {exc}", file=sys.stderr)
-        return 1
-    except requests.RequestException as exc:
-        print(f"通信エラー: {exc}", file=sys.stderr)
-        return 1
-    except (TypeError, ValueError) as exc:
-        print(f"エラー: {exc}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("\n処理を中断しました。")
-        return 130
+    if args.start_date and args.start_date > args.end_date:
+        print("エラー: start-dateはend-date以前にしてください。", file=sys.stderr)
+        return 2
+    return run_journals_cli(args, MoneyForwardClient)
 
 
 if __name__ == "__main__":

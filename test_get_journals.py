@@ -106,7 +106,7 @@ class FetchAllJournalsTests(unittest.TestCase):
             "two",
         ])
 
-    def test_mid_fetch_api_error_propagates_without_saving_files(self) -> None:
+    def test_mid_fetch_api_error_preserves_raw_pages_and_failed_manifest(self) -> None:
         client = FakeClient(
             [
                 journal_page([{"id": str(index)} for index in range(100)]),
@@ -134,7 +134,11 @@ class FetchAllJournalsTests(unittest.TestCase):
                 status = get_journals.main()
 
             self.assertEqual(status, 1)
-            self.assertFalse(output_dir.exists())
+            self.assertTrue((output_dir / "journals/pages/page_0001.json").exists())
+            manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "failed")
+            self.assertFalse(manifest["complete"])
+            self.assertFalse((output_dir / "journals_2025-11-01_2026-10-31_all.json").exists())
 
     def test_maximum_page_limit_raises_instead_of_returning_partial_data(self) -> None:
         full_page = journal_page([{"id": "one"}, {"id": "two"}])

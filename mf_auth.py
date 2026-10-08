@@ -24,6 +24,10 @@ SCOPES = [
     "mfc/accounting/offices.read",
     "mfc/accounting/accounts.read",
     "mfc/accounting/journal.read",
+    "mfc/accounting/departments.read",
+    "mfc/accounting/taxes.read",
+    "mfc/accounting/trade_partners.read",
+    "mfc/accounting/report.read",
 ]
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -146,28 +150,8 @@ def is_access_token_valid(token: dict[str, Any]) -> bool:
 
 
 def response_error_message(response: requests.Response) -> str:
-    """APIエラーを表示しやすい文字列へ変換する。"""
-    try:
-        payload = response.json()
-        detail = json.dumps(payload, ensure_ascii=False, indent=2)
-    except ValueError:
-        detail = response.text.strip() or "(response body is empty)"
-
-    request_id = (
-        response.headers.get("X-Request-Id")
-        or response.headers.get("x-request-id")
-    )
-
-    message = (
-        f"HTTP {response.status_code}\n"
-        f"URL: {response.url}\n"
-        f"Response:\n{detail}"
-    )
-
-    if request_id:
-        message += f"\nRequest ID: {request_id}"
-
-    return message
+    """認証値・会計情報を含み得るURL/本文/ヘッダーは表示しない。"""
+    return f"HTTP {response.status_code}（レスポンス本文は非表示）"
 
 
 def exchange_authorization_code(
